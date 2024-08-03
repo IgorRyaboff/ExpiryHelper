@@ -3,6 +3,10 @@ const telegraf = require('telegraf');
 const sequelize = require('sequelize');
 const moment = require('moment');
 const crypto = require("crypto");
+const cron = require('cron');
+
+const securityToken = crypto.randomInt(1000000000, 9999999999);
+console.log('Security token for current session is ' + securityToken);
 
 /** @type {sequelize.Sequelize} */
 let db;
@@ -42,6 +46,16 @@ bot.use(async (ctx, next) => {
 });
 
 bot.command('new', async ctx => {
+    let expiredCount = await db.models.Product.count({
+        where: { family: ctx.dbUser.family, withdrawn: null, expires: { [sequelize.Op.lt]: new Date } },
+        transaction: ctx.transaction,
+    });
+    if (expiredCount > 0) {
+        await ctx.reply('🛑 Есть неудаленные просроченные продукты (/listexpired)');
+        await ctx.transaction.commit();
+        return;
+    }
+
     ctx.dbUser.currentAction = { action: 'new.requestName' };
     await ctx.dbUser.save({ transaction: ctx.transaction });
 
@@ -50,21 +64,55 @@ bot.command('new', async ctx => {
 });
 
 bot.command('list', async ctx => {
+    await processListCommand(ctx, false);
+});
+
+bot.command('listexpired', async ctx => {
+    await processListCommand(ctx, true);
+});
+
+async function processListCommand(ctx, onlyExpired) {
+    let whereStatement = { family: ctx.dbUser.family, withdrawn: null, };
+    if (onlyExpired) whereStatement.expires = { [sequelize.Op.lt]: new Date };
+
     let list = await db.models.Product.findAll({
-        where: { family: ctx.dbUser.family, withdrawn: null, },
+        where: whereStatement,
         transaction: ctx.transaction,
         order: [['expires', 'ASC']],
         limit: 20,
     });
 
     if (list.length == 0) {
-        ctx.reply('Нет активных продуктов');
+        ctx.reply(onlyExpired ? 'Нет просроченных продуктов' : 'Нет активных продуктов');
         await ctx.transaction.commit();
         return;
     }
 
-    let texts = list.map(product => `<b>№${product.code}</b> ${product.name} (до ${moment(product.expires).format('DD.MM.YY')})`);
-    ctx.reply(texts.join('\n'), { parse_mode: 'HTML', });
+    let texts = list.map(product => {
+        let result = `<b>№${product.code}</b> ${product.name} (до ${moment(product.expires).format('DD.MM.YY')})`;
+        if (!onlyExpired && product.expires < new Date) result = `<u>${result}</u>`;
+        return result;
+    });
+    const title = onlyExpired ? 'Список просроченных продуктов:' : 'Список продуктов (просроченные <u>подчеркнуты</u>):\n';
+    ctx.reply(title + '\n' + texts.join('\n'), { parse_mode: 'HTML', });
+    await ctx.transaction.commit();
+}
+
+bot.command('notificationcron', async ctx => {
+    let givenSecurityToken = +ctx.message.text.replace('/notificationcron ', '');
+    if (givenSecurityToken == securityToken) {
+        await notifyAboutExpiredProducts();
+        await ctx.reply('OK');
+    }
+    await ctx.transaction.commit();
+});
+
+bot.command('cleanupcron', async ctx => {
+    let givenSecurityToken = +ctx.message.text.replace('/cleanupcron ', '');
+    if (givenSecurityToken == securityToken) {
+        await cleanupWithdrawnProducts();
+        await ctx.reply('OK');
+    }
     await ctx.transaction.commit();
 });
 
@@ -246,7 +294,7 @@ bot.hears(/.+/, async ctx => {
     }
     else {
         let productCode = +ctx.message.text;
-        if (!isNaN(productCode) && Number.isInteger(productCode) && productCode >= 1000 && productCode <= 9999) {
+        if (!isNaN(productCode) && Number.isInteger(productCode) && productCode >= 1000 && productCode <= 99999999) {
             let product = await db.models.Product.findOne({
                 where: { code: productCode, family: ctx.dbUser.family, },
                 transaction: ctx.transaction,
@@ -282,7 +330,7 @@ bot.hears(/.+/, async ctx => {
     }
 });
 
-bot.action(/withdraw_[0-9]{4}/, async ctx => {
+bot.action(/withdraw_[0-9]{4,}/, async ctx => {
     let productCode = +ctx.callbackQuery.data.split('_')[1];
     let product = await db.models.Product.findOne({
         where: { code: productCode, family: ctx.dbUser.family, },
@@ -313,3 +361,53 @@ bot.action(/withdraw_[0-9]{4}/, async ctx => {
 bot.use(ctx => {
     if (!ctx.transaction.finished) ctx.transaction.commit();
 });
+
+async function notifyAboutExpiredProducts() {
+    let products = await db.models.Product.findAll({
+        
+        where: {
+            withdrawn: null,
+            expires: { [sequelize.Op.lt]: new Date },
+        },
+    });
+
+    let families = new Set;
+
+    for (let item of products) {
+        families.add(item.family);
+    }
+
+    families = Array.from(families);
+
+    let users = await db.models.User.findAll({
+        where: {
+            family: { [sequelize.Op.in]: families }
+        }
+    });
+
+    for (let user of users) {
+        try {
+            await bot.telegram.sendMessage(user.id, '❗ Есть просроченные продукты. Используйте /listexpired для просмотра списка');
+        }
+        catch {
+            // Nothing critical happened, so not doing anything
+        }
+    }
+}
+
+async function cleanupWithdrawnProducts() {
+    let aWeekAgo = new Date((+new Date) - (1000 * 86400 * 7));
+    let deletedCount = await db.models.Product.destroy({
+        where: {
+            withdrawn: { [sequelize.Op.ne]: null },
+            expires: { [sequelize.Op.lt]: aWeekAgo },
+        },
+    });
+    console.log(`Deleted ${deletedCount} withdrawn products`);
+}
+
+new cron.CronJob('0 10 * * *', notifyAboutExpiredProducts, undefined, true);
+console.log(`Notification cron job will start at ${cron.sendAt('0 10 * * *')}`);
+
+new cron.CronJob('0 0 * * *', cleanupWithdrawnProducts, undefined, true);
+console.log(`Cleanup cron job will start at ${cron.sendAt('0 0 * * *')}`);

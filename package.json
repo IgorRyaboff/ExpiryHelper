@@ -1,6 +1,6 @@
 {
     "name": "expiryhelper",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "main": "app.js",
     "scripts": {
         "test": "echo \"Error: no test specified\" && exit 1"
@@ -9,6 +9,7 @@
     "license": "MIT",
     "description": "",
     "dependencies": {
+        "cron": "^3.1.7",
         "moment": "^2.30.1",
         "pg": "^8.12.0",
         "pg-hstore": "^2.3.4",
