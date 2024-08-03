@@ -64,39 +64,44 @@ bot.command('new', async ctx => {
 });
 
 bot.command('list', async ctx => {
-    await processListCommand(ctx, false);
+    await processListCommand(ctx, {}, 'Список продуктов (просроченные <u>подчеркнуты</u>):', 'Нет активных продуктов');
+    await ctx.transaction.commit();
 });
 
 bot.command('listexpired', async ctx => {
-    await processListCommand(ctx, true);
+    await processListCommand(ctx, { expires: { [sequelize.Op.lt]: new Date } }, 'Список просроченных продуктов:', 'Нет просроченных продуктов');
+    await ctx.transaction.commit();
 });
 
-async function processListCommand(ctx, onlyExpired) {
-    let whereStatement = { family: ctx.dbUser.family, withdrawn: null, };
-    if (onlyExpired) whereStatement.expires = { [sequelize.Op.lt]: new Date };
-
+async function processListCommand(ctx, additionalWhereConditions = {}, title, noProductsMessage) {
+    let whereStatement = { family: ctx.dbUser.family, withdrawn: null, ...additionalWhereConditions };
     let list = await db.models.Product.findAll({
         where: whereStatement,
         transaction: ctx.transaction,
         order: [['expires', 'ASC']],
-        limit: 20,
     });
 
     if (list.length == 0) {
-        ctx.reply(onlyExpired ? 'Нет просроченных продуктов' : 'Нет активных продуктов');
+        ctx.reply(noProductsMessage);
         await ctx.transaction.commit();
         return;
     }
 
     let texts = list.map(product => {
         let result = `<b>№${product.code}</b> ${product.name} (до ${moment(product.expires).format('DD.MM.YY')})`;
-        if (!onlyExpired && product.expires < new Date) result = `<u>${result}</u>`;
+        if (product.expires < new Date) result = `<u>${result}</u>`;
         return result;
     });
-    const title = onlyExpired ? 'Список просроченных продуктов:' : 'Список продуктов (просроченные <u>подчеркнуты</u>):\n';
-    ctx.reply(title + '\n' + texts.join('\n'), { parse_mode: 'HTML', });
-    await ctx.transaction.commit();
+    ctx.reply(title + '\n\n' + texts.join('\n'), { parse_mode: 'HTML', });
 }
+
+bot.command('inventory', async ctx => {
+    ctx.dbUser.currentAction = { action: 'inventory' };
+    await ctx.dbUser.save({ transaction: ctx.transaction });
+
+    await ctx.reply('Введите в следующем сообщением коды всех продуктов, которые фактически найдены у вас дома. Одна строка - один код', { parse_mode: 'HTML' });
+    await ctx.transaction.commit();
+});
 
 bot.command('notificationcron', async ctx => {
     let givenSecurityToken = +ctx.message.text.replace('/notificationcron ', '');
@@ -291,6 +296,16 @@ bot.hears(/.+/, async ctx => {
 
         await ctx.transaction.commit();
         ctx.reply('Вы успешно переключились на другую "семью"');
+    }
+    else if (ctx.dbUser.currentAction?.action == 'inventory') {
+        let codes = ctx.message.text.split('\n');
+        const title = 'Пропущенные продукты:';
+        const noProductsMessage = 'Не было пропущено ни одного продукта, ура!';
+        processListCommand(ctx, { code: { [sequelize.Op.notIn]: codes } }, title, noProductsMessage);
+
+        ctx.dbUser.currentAction = null;
+        await ctx.dbUser.save({ transaction: ctx.transaction, });
+        await ctx.transaction.commit();
     }
     else {
         let productCode = +ctx.message.text;
