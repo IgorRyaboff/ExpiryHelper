@@ -81,8 +81,6 @@ bot.command('listexpired', async ctx => {
 
 async function processListCommand(ctx, additionalWhereConditions = {}, title, noProductsMessage) {
     let whereStatement = { family: ctx.dbUser.family, withdrawn: null, ...additionalWhereConditions };
-async function processListCommand(ctx, additionalWhereConditions = {}, title, noProductsMessage) {
-    let whereStatement = { family: ctx.dbUser.family, withdrawn: null, ...additionalWhereConditions };
     let list = await db.models.Product.findAll({
         where: whereStatement,
         order: [['expires', 'ASC']],
