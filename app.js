@@ -4,6 +4,9 @@ const sequelize = require('sequelize');
 const moment = require('moment');
 const crypto = require("crypto");
 const cron = require('cron');
+const dotenv = require('dotenv');
+
+dotenv.config();
 
 const securityToken = crypto.randomInt(1000000000, 9999999999);
 console.log('Security token for current session is ' + securityToken);
@@ -11,11 +14,22 @@ console.log('Security token for current session is ' + securityToken);
 /** @type {sequelize.Sequelize} */
 let db;
 
+function telegrafToken() {
+    const value = process.env.TELEGRAF_TOKEN;
+    if (!value) throw 'No TELEGRAF_TOKEN env variable set. Set this env variable system-wide, container-wide or via .env file';
+    
+    return value;
+}
+
 /** @type {telegraf.Telegraf} */
-let bot = new telegraf.Telegraf(require('./etc/telegraf.json').token);
+let bot = new telegraf.Telegraf(telegrafToken());
 
 async function init() {
-    db = new sequelize.Sequelize(require('./etc/sequelize.json'));
+    db = new sequelize.Sequelize({
+        dialect: 'sqlite',
+        storage: '/data/db.sqlite3',
+        logging: false
+    });
 
     await db.authenticate();
     console.log('Database connection OK');
@@ -29,16 +43,13 @@ async function init() {
 init();
 
 bot.use(async (ctx, next) => {
-    let transaction = await db.transaction();
-    ctx.transaction = transaction;
-
-    let user = await db.models.User.findByPk(ctx.from.id, { transaction, lock: true });
+    let user = await db.models.User.findByPk(ctx.from.id);
     if (!user) {
         user = db.models.User.build({
             id: ctx.from.id,
             family: ctx.from.id,
         });
-        await user.save({ transaction });
+        await user.save();
     }
     ctx.dbUser = user;
 
@@ -48,42 +59,35 @@ bot.use(async (ctx, next) => {
 bot.command('new', async ctx => {
     let expiredCount = await db.models.Product.count({
         where: { family: ctx.dbUser.family, withdrawn: null, expires: { [sequelize.Op.lt]: new Date } },
-        transaction: ctx.transaction,
     });
     if (expiredCount > 0) {
         await ctx.reply('🛑 Есть неудаленные просроченные продукты (/listexpired)');
-        await ctx.transaction.commit();
         return;
     }
 
     ctx.dbUser.currentAction = { action: 'new.requestName' };
-    await ctx.dbUser.save({ transaction: ctx.transaction });
+    await ctx.dbUser.save();
 
     await ctx.reply('Введите наименование продукта (например, <i>молоко</i>)', { parse_mode: 'HTML' });
-    await ctx.transaction.commit();
 });
 
 bot.command('list', async ctx => {
     await processListCommand(ctx, {}, 'Список продуктов (просроченные <u>подчеркнуты</u>):', 'Нет активных продуктов');
-    await ctx.transaction.commit();
 });
 
 bot.command('listexpired', async ctx => {
     await processListCommand(ctx, { expires: { [sequelize.Op.lt]: new Date } }, 'Список просроченных продуктов:', 'Нет просроченных продуктов');
-    await ctx.transaction.commit();
 });
 
 async function processListCommand(ctx, additionalWhereConditions = {}, title, noProductsMessage) {
     let whereStatement = { family: ctx.dbUser.family, withdrawn: null, ...additionalWhereConditions };
     let list = await db.models.Product.findAll({
         where: whereStatement,
-        transaction: ctx.transaction,
         order: [['expires', 'ASC']],
     });
 
     if (list.length == 0) {
         ctx.reply(noProductsMessage);
-        await ctx.transaction.commit();
         return;
     }
 
@@ -97,10 +101,9 @@ async function processListCommand(ctx, additionalWhereConditions = {}, title, no
 
 bot.command('inventory', async ctx => {
     ctx.dbUser.currentAction = { action: 'inventory' };
-    await ctx.dbUser.save({ transaction: ctx.transaction });
+    await ctx.dbUser.save();
 
     await ctx.reply('Введите в следующем сообщением коды всех продуктов, которые фактически найдены у вас дома. Одна строка - один код', { parse_mode: 'HTML' });
-    await ctx.transaction.commit();
 });
 
 bot.command('notificationcron', async ctx => {
@@ -109,7 +112,6 @@ bot.command('notificationcron', async ctx => {
         await notifyAboutExpiredProducts();
         await ctx.reply('OK');
     }
-    await ctx.transaction.commit();
 });
 
 bot.command('cleanupcron', async ctx => {
@@ -118,18 +120,15 @@ bot.command('cleanupcron', async ctx => {
         await cleanupWithdrawnProducts();
         await ctx.reply('OK');
     }
-    await ctx.transaction.commit();
 });
 
 bot.command('invite', async ctx => {
     await db.models.Invite.findAll({
         limit: 1,
-        lock: true,
-        transaction: ctx.transaction,
     });
 
     let code = undefined;
-    while (!code || (await db.models.Invite.findByPk(code, { transaction: ctx.transaction, }))) {
+    while (!code || (await db.models.Invite.findByPk(code))) {
         code = crypto.randomInt(100000, 1000000);
     }
 
@@ -138,24 +137,21 @@ bot.command('invite', async ctx => {
         family: ctx.dbUser.family,
         expires: new Date(+new Date + 1000 * 3600),
     });
-    await invite.save({ transaction: ctx.transaction, });
-    await ctx.transaction.commit();
+    await invite.save();
     ctx.reply(`Новый код приглашения: <b>${code}</b>`, { parse_mode: 'HTML' });
 });
 
 bot.command('acceptinvite', async ctx => {
     ctx.dbUser.currentAction = { action: 'acceptinvite' };
-    await ctx.dbUser.save({ transaction: ctx.transaction, });
-    await ctx.transaction.commit();
+    await ctx.dbUser.save();
     ctx.reply('Введите код приглашения. Для отмены используйте /cancel');
 });
 
 bot.command('cancel', async ctx => {
     ctx.dbUser.currentAction = null;
-    await ctx.dbUser.save({ transaction: ctx.transaction });
+    await ctx.dbUser.save();
 
     await ctx.reply('Текущее действие отменено');
-    await ctx.transaction.commit();
 });
 
 bot.hears(/.+/, async ctx => {
@@ -165,8 +161,7 @@ bot.hears(/.+/, async ctx => {
             name: ctx.message.text,
         };
         await ctx.reply('Укажите срок годности (например, 12, 12.06, 12.06.2024, 12.06.24). К сроку можно добавить количество дней (12.06 + 10 сут/мес/лет)');
-        await ctx.dbUser.save({ transaction: ctx.transaction });
-        await ctx.transaction.commit();
+        await ctx.dbUser.save();
     }
     else if (ctx.dbUser.currentAction?.action == 'new.requestDate') {
         let textParts = ctx.message.text.split('+').map(x => x.trim());
@@ -184,7 +179,6 @@ bot.hears(/.+/, async ctx => {
 
                     if (!momentDate.isValid()) {
                         await ctx.reply('Указана некорректная дата');
-                        await ctx.transaction.commit();
                         return;
                     }
                 }
@@ -200,7 +194,6 @@ bot.hears(/.+/, async ctx => {
 
             if (isNaN(count) || count < 0 || !Number.isInteger(count)) {
                 await ctx.reply('Указан неверный модификатор даты');
-                await ctx.transaction.commit();
                 return;
             }
 
@@ -211,7 +204,6 @@ bot.hears(/.+/, async ctx => {
             }[type];
             if (!modifierCoefficient) {
                 await ctx.reply('Указан неверный модификатор даты');
-                await ctx.transaction.commit();
                 return;
             }
 
@@ -221,21 +213,17 @@ bot.hears(/.+/, async ctx => {
 
         if (date < new Date) {
             await ctx.reply('Указана дата меньше текущей. Продукт не просрочен?');
-            await ctx.transaction.commit();
             return;
         }
 
         await db.models.Product.findAll({
             where: { family: ctx.dbUser.family, },
-            transaction: ctx.transaction,
-            lock: true,
             limit: 1,
         });
 
         let productCode;
         while (!productCode || (await db.models.Product.count({
             where: { code: productCode, family: ctx.dbUser.family, },
-            transaction: ctx.transaction,
         })) > 0) {
             productCode = crypto.randomInt(1000, 10000);
         }
@@ -246,32 +234,26 @@ bot.hears(/.+/, async ctx => {
             name: ctx.dbUser.currentAction.name,
             expires: date,
         });
-        await product.save({ transaction: ctx.transaction });
+        await product.save();
         
         ctx.dbUser.currentAction = null;
-        await ctx.dbUser.save({ transaction: ctx.transaction });
-
-        await ctx.transaction.commit();
-
+        await ctx.dbUser.save();
         await ctx.reply(`Код нового продукта: <b>${productCode}</b>\nСрок годности: ${moment(date).format('DD.MM.YYYY')}`, {parse_mode: 'HTML'});
     }
     else if (ctx.dbUser.currentAction?.action == 'acceptinvite') {
         code = +ctx.message.text;
         if (isNaN(code)) {
-            await ctx.transaction.commit();
             ctx.reply('Код приглашения указан неверно');
             return;
         }
 
-        let invite = await db.models.Invite.findByPk(code, { transaction: ctx.transaction, lock: true, });
+        let invite = await db.models.Invite.findByPk(code);
         if (!invite || invite.expires < new Date ) {
-            await ctx.transaction.commit();
             ctx.reply('Код приглашения отсутствует или срок его действия истек');
             return;
         }
 
         if (invite.family == ctx.dbUser.family) {
-            await ctx.transaction.commit();
             ctx.reply('Код приглашения относится к текущей "семье"');
             return;
         }
@@ -279,22 +261,19 @@ bot.hears(/.+/, async ctx => {
         let currentFamilyHasProducts = (await db.models.Product.count({ where: { family: ctx.dbUser.family, withdrawn: null } })) > 0;
         let currentFamilyHasOnlyCurrentUser = (await db.models.User.count({
             where: { family: ctx.dbUser.family, id: { [sequelize.Op.ne]: ctx.dbUser.id }, },
-            transaction: ctx.transaction,
         })) > 0;
 
         if (currentFamilyHasOnlyCurrentUser && currentFamilyHasProducts) {
-            await ctx.transaction.commit();
             ctx.reply('У вас сейчас есть активные продукты. Переключение на другую "семью" невозможно');
             return;
         }
         
         ctx.dbUser.family = invite.family;
         ctx.dbUser.currentAction = null;
-        await ctx.dbUser.save({ transaction: ctx.transaction, });
+        await ctx.dbUser.save();
 
-        await invite.destroy({ transaction: ctx.transaction, });
+        await invite.destroy();
 
-        await ctx.transaction.commit();
         ctx.reply('Вы успешно переключились на другую "семью"');
     }
     else if (ctx.dbUser.currentAction?.action == 'inventory') {
@@ -304,27 +283,22 @@ bot.hears(/.+/, async ctx => {
         processListCommand(ctx, { code: { [sequelize.Op.notIn]: codes } }, title, noProductsMessage);
 
         ctx.dbUser.currentAction = null;
-        await ctx.dbUser.save({ transaction: ctx.transaction, });
-        await ctx.transaction.commit();
+        await ctx.dbUser.save();
     }
     else {
         let productCode = +ctx.message.text;
         if (!isNaN(productCode) && Number.isInteger(productCode) && productCode >= 1000 && productCode <= 99999999) {
             let product = await db.models.Product.findOne({
                 where: { code: productCode, family: ctx.dbUser.family, },
-                transaction: ctx.transaction,
-                lock: true,
             });
 
             if (!product) {
                 ctx.reply('Продукт с указанным кодом не найден');
-                await ctx.transaction.commit();
                 return;
             }
 
             if (product.withdrawn) {
                 ctx.reply('Продукт с указанным кодом уже удален');
-                await ctx.transaction.commit();
                 return;
             }
 
@@ -337,10 +311,6 @@ bot.hears(/.+/, async ctx => {
                 parse_mode: 'HTML',
                 ...keyboard
             });
-            await ctx.transaction.commit();
-        }
-        else {
-            await ctx.transaction.commit();
         }
     }
 });
@@ -349,32 +319,23 @@ bot.action(/withdraw_[0-9]{4,}/, async ctx => {
     let productCode = +ctx.callbackQuery.data.split('_')[1];
     let product = await db.models.Product.findOne({
         where: { code: productCode, family: ctx.dbUser.family, },
-        transaction: ctx.transaction,
-        lock: true,
     });
     
     await ctx.answerCbQuery();
 
     if (!product) {
         ctx.reply('Продукт с указанным кодом не найден');
-        await ctx.transaction.commit();
         return;
     }
 
     if (product.withdrawn) {
         ctx.reply('Продукт с указанным кодом уже удален');
-        await ctx.transaction.commit();
         return;
     }
 
     product.withdrawn = new Date;
-    await product.save({ transaction: ctx.transaction, });
-    await ctx.transaction.commit();
+    await product.save();
     ctx.reply('Продукт удален, спасибо :)');
-});
-
-bot.use(ctx => {
-    if (!ctx.transaction.finished) ctx.transaction.commit();
 });
 
 async function notifyAboutExpiredProducts() {

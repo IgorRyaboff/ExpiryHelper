@@ -1,8 +1,0 @@
-{
-    "dialect": "postgres",
-    "host": "localhost",
-    "username": "postgres",
-    "password": "postgres",
-    "database": "ExpiryHelper",
-    "logging": false
-}
