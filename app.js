@@ -81,6 +81,8 @@ bot.command('listexpired', async ctx => {
 
 async function processListCommand(ctx, additionalWhereConditions = {}, title, noProductsMessage) {
     let whereStatement = { family: ctx.dbUser.family, withdrawn: null, ...additionalWhereConditions };
+async function processListCommand(ctx, additionalWhereConditions = {}, title, noProductsMessage) {
+    let whereStatement = { family: ctx.dbUser.family, withdrawn: null, ...additionalWhereConditions };
     let list = await db.models.Product.findAll({
         where: whereStatement,
         order: [['expires', 'ASC']],
@@ -93,6 +95,7 @@ async function processListCommand(ctx, additionalWhereConditions = {}, title, no
 
     let texts = list.map(product => {
         let result = `<b>№${product.code}</b> ${product.name} (до ${moment(product.expires).format('DD.MM.YY')})`;
+        if (product.expires < new Date) result = `<u>${result}</u>`;
         if (product.expires < new Date) result = `<u>${result}</u>`;
         return result;
     });
